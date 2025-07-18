@@ -1,0 +1,88 @@
+WITH base AS (
+  SELECT
+    CASE
+      WHEN type_function = 'АС - ОСТАТКИ' AND EXTRACT(DAY FROM date) <= 15
+        THEN CAST(DATE_TRUNC(DATE_SUB(date, INTERVAL 1 MONTH), MONTH) AS DATE)
+      WHEN type_function = 'АС - ОСТАТКИ' AND EXTRACT(DAY FROM date) > 15
+        THEN CAST(DATE_TRUNC(DATE_ADD(date, INTERVAL 1 MONTH), MONTH) AS DATE)
+      ELSE date
+    END AS date1,
+    type_function,
+    amount_per,
+    distr_net_id,
+    product_id
+  FROM spring-house-227207.RUS_PHARMACY_CHAIN.DataMart_Actual
+),
+
+agg_per_type AS (
+  SELECT
+    date1,
+    type_function,
+    SUM(amount_per) AS amount,
+    distr_net_id,
+    product_id
+  FROM base
+  GROUP BY date1, type_function, distr_net_id, product_id
+),
+
+combined AS (
+  SELECT
+    date1,
+    distr_net_id,
+    product_id,
+    SUM(CASE WHEN type_function IN ('АС - ПРОДАЖИ', 'АС - ОТГРУЗКИ') THEN amount ELSE 0 END) AS amount_po,
+    SUM(CASE WHEN type_function IN ('АС - ЗАКУПКИ', 'АС - ПРОДАЖИ', 'АС - ОТГРУЗКИ') THEN amount ELSE 0 END) AS amount_zpo,
+    SUM(CASE WHEN type_function IN ('АС - ЗАКУПКИ', 'АС - ОТГРУЗКИ') THEN amount ELSE 0 END) AS amount_zo,
+    SUM(CASE WHEN type_function IN ('АС - ЗАКУПКИ', 'АС - ПРОДАЖИ') THEN amount ELSE 0 END) AS amount_zp
+  FROM agg_per_type
+  GROUP BY date1, distr_net_id, product_id
+),
+
+actual AS (
+  SELECT date1, type_function, amount, distr_net_id, product_id
+  FROM agg_per_type
+  
+  UNION ALL
+  SELECT date1, 'АС - ПРОДАЖИ + ОТГРУЗКИ' AS type_function, amount_po AS amount, distr_net_id, product_id
+  FROM combined
+  -- WHERE amount_po != 0  -- Опционально: добавить, чтобы избежать строк с 0, если не нужны
+  
+  UNION ALL
+  SELECT date1, 'АС - ЗАКУПКИ + ПРОДАЖИ + ОТГРУЗКИ' AS type_function, amount_zpo AS amount, distr_net_id, product_id
+  FROM combined
+  -- WHERE amount_zpo != 0
+  
+  UNION ALL
+  SELECT date1, 'АС - ЗАКУПКИ + ОТГРУЗКИ' AS type_function, amount_zo AS amount, distr_net_id, product_id
+  FROM combined
+  -- WHERE amount_zo != 0
+  
+  UNION ALL
+  SELECT date1, 'АС - ЗАКУПКИ + ПРОДАЖИ' AS type_function, amount_zp AS amount, distr_net_id, product_id
+  FROM combined
+  -- WHERE amount_zp != 0
+),
+
+res AS (
+  SELECT 
+    date1, 
+    type_function, 
+    da.distr_net_id, 
+    product_id, 
+    dateStart, 
+    dateEnd, 
+    priceListName, 
+    amount, 
+    price, 
+    amount * price AS value
+  FROM actual da
+  LEFT JOIN spring-house-227207.RUS_PHARMACY_CHAIN.DICT_PhC_Price p
+    ON da.distr_net_id = p.distr_net_id
+    AND da.product_id = p.skuCode
+    AND da.date1 >= p.dateStart 
+    AND da.date1 <= p.dateEnd
+    AND priceListName LIKE '%Контрактный FY%'
+  ORDER BY date1, da.distr_net_id, product_id ASC  -- Если сортировка не нужна, удалите для экономии
+)
+
+SELECT * FROM res;
