@@ -1,88 +1,274 @@
-WITH base AS (
-  SELECT
-    CASE
-      WHEN type_function = 'АС - ОСТАТКИ' AND EXTRACT(DAY FROM date) <= 15
-        THEN CAST(DATE_TRUNC(DATE_SUB(date, INTERVAL 1 MONTH), MONTH) AS DATE)
-      WHEN type_function = 'АС - ОСТАТКИ' AND EXTRACT(DAY FROM date) > 15
-        THEN CAST(DATE_TRUNC(DATE_ADD(date, INTERVAL 1 MONTH), MONTH) AS DATE)
-      ELSE date
-    END AS date1,
-    type_function,
-    amount_per,
-    distr_net_id,
-    product_id
-  FROM spring-house-227207.RUS_PHARMACY_CHAIN.DataMart_Actual
-),
+import os
+import glob
+import traceback
+from datetime import datetime, timedelta
 
-agg_per_type AS (
-  SELECT
-    date1,
-    type_function,
-    SUM(amount_per) AS amount,
-    distr_net_id,
-    product_id
-  FROM base
-  GROUP BY date1, type_function, distr_net_id, product_id
-),
+from airflow import DAG
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.providers.google.cloud.transfers.gcs_to_gcs import GCSToGCSOperator
+from airflow.providers.google.cloud.transfers.gcs_to_local import GCSToLocalFilesystemOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.models import Variable
+from google.cloud import bigquery
 
-combined AS (
-  SELECT
-    date1,
-    distr_net_id,
-    product_id,
-    SUM(CASE WHEN type_function IN ('АС - ПРОДАЖИ', 'АС - ОТГРУЗКИ') THEN amount ELSE 0 END) AS amount_po,
-    SUM(CASE WHEN type_function IN ('АС - ЗАКУПКИ', 'АС - ПРОДАЖИ', 'АС - ОТГРУЗКИ') THEN amount ELSE 0 END) AS amount_zpo,
-    SUM(CASE WHEN type_function IN ('АС - ЗАКУПКИ', 'АС - ОТГРУЗКИ') THEN amount ELSE 0 END) AS amount_zo,
-    SUM(CASE WHEN type_function IN ('АС - ЗАКУПКИ', 'АС - ПРОДАЖИ') THEN amount ELSE 0 END) AS amount_zp
-  FROM agg_per_type
-  GROUP BY date1, distr_net_id, product_id
-),
+from plugins.gbq_plugin.bq_session import BigQuerySession
+from plugins.gbq_plugin.bq_transacition import BigQueryTransaction
+from plugins.gcs_plugin.operators import CustomGCSListObjectsOperator, GCSGetFileOwnerOperator
+from plugins.gcs_plugin.sensors import CustomGCSObjectExistenceSensor
+from rubbles_dags.templates.common.files_log import FilesLog
+from rubbles_dags.templates.common.process_exception import ProcessException
+from rubbles_dags.templates.common.status_informer import StatusInformer
+from rubbles_dags.templates.load.dag_factory import LoadDagContext
+import rubbles_dags.templates.marketing_plans.context as marketing_plans
+import rubbles_dags.templates.price_plans.context as price_plans
+import rubbles_dags.templates.volume_plans.context as volume_plans
+import rubbles_dags.templates.focus_group.context as focus_group
 
-actual AS (
-  SELECT date1, type_function, amount, distr_net_id, product_id
-  FROM agg_per_type
-  
-  UNION ALL
-  SELECT date1, 'АС - ПРОДАЖИ + ОТГРУЗКИ' AS type_function, amount_po AS amount, distr_net_id, product_id
-  FROM combined
-  -- WHERE amount_po != 0  -- Опционально: добавить, чтобы избежать строк с 0, если не нужны
-  
-  UNION ALL
-  SELECT date1, 'АС - ЗАКУПКИ + ПРОДАЖИ + ОТГРУЗКИ' AS type_function, amount_zpo AS amount, distr_net_id, product_id
-  FROM combined
-  -- WHERE amount_zpo != 0
-  
-  UNION ALL
-  SELECT date1, 'АС - ЗАКУПКИ + ОТГРУЗКИ' AS type_function, amount_zo AS amount, distr_net_id, product_id
-  FROM combined
-  -- WHERE amount_zo != 0
-  
-  UNION ALL
-  SELECT date1, 'АС - ЗАКУПКИ + ПРОДАЖИ' AS type_function, amount_zp AS amount, distr_net_id, product_id
-  FROM combined
-  -- WHERE amount_zp != 0
-),
+from rubbles_dags.utils.bq_client_builder import build_bq_client
+import logging
 
-res AS (
-  SELECT 
-    date1, 
-    type_function, 
-    da.distr_net_id, 
-    product_id, 
-    dateStart, 
-    dateEnd, 
-    priceListName, 
-    amount, 
-    price, 
-    amount * price AS value
-  FROM actual da
-  LEFT JOIN spring-house-227207.RUS_PHARMACY_CHAIN.DICT_PhC_Price p
-    ON da.distr_net_id = p.distr_net_id
-    AND da.product_id = p.skuCode
-    AND da.date1 >= p.dateStart 
-    AND da.date1 <= p.dateEnd
-    AND priceListName LIKE '%Контрактный FY%'
-  ORDER BY date1, da.distr_net_id, product_id ASC  -- Если сортировка не нужна, удалите для экономии
-)
+from rubbles_dags.utils.constants import GCP_CONN_ID
+from rubbles_dags.utils.dwh_tables import FilesLogDWHTable
 
-SELECT * FROM res;
+logger = logging.getLogger(__name__)  # todo move?
+environment = Variable.get('AIRFLOW_ENV', default_var='dev')
+
+def clean_folder(path: str):
+    files = glob.glob(f"{path}/*")
+    for f in files:
+        os.remove(f)
+
+
+def process_file(filepath, bq_client, context: LoadDagContext):
+    from importlib.metadata import version
+
+    logger.info("Google-api-bigquery version", version('google-cloud-bigquery'))
+    load_configs = context.get_load_configs(filepath, bq_client)
+    with BigQuerySession(bq_client) as session_id:
+        with BigQueryTransaction(bq_client, session_id):
+            filename = filepath.split("/")[-1]
+            job = bq_client.query(
+                f"UPDATE PHARMACY_CHAINS.versions SET deleted = TRUE WHERE file_name = '{filename}'",
+                job_config=bigquery.QueryJobConfig(
+                    create_session=False,
+                    connection_properties=[
+                        bigquery.query.ConnectionProperty(
+                            key="session_id", value=session_id
+                        )
+                    ],
+                )
+            )
+            job.result()
+
+            for load_config in load_configs:
+                load_job_config = bigquery.LoadJobConfig(
+                    schema=load_config.bq_schema,
+                    write_disposition='WRITE_APPEND',  # do not delete existing data
+                    connection_properties=[
+                        bigquery.query.ConnectionProperty(
+                            key="session_id", value=session_id
+                        )
+                    ],
+                )
+                print(load_config.df.columns.tolist())
+                if 'and_extra_plan_number' in load_config.df.columns:
+                    load_config.df['and_extra_plan_number'] = load_config.df['and_extra_plan_number'].astype(str)
+                    load_config.df['and_extra_plan_number'] = load_config.df['and_extra_plan_number'].replace(['nan', 'None'], '')
+                    load_config.df['and_extra_plan_number'] = load_config.df['and_extra_plan_number'].astype(str)
+                if 'and_rule_number' in load_config.df.columns:
+                    load_config.df['and_rule_number'] = load_config.df['and_rule_number'].astype(str)
+                    load_config.df['and_rule_number'] = load_config.df['and_rule_number'].replace(['nan', 'None'], '')
+                    load_config.df['and_rule_number'] = load_config.df['and_rule_number'].astype(str)
+                job = bq_client.load_table_from_dataframe(
+                    dataframe=load_config.df,
+                    destination=f'{load_config.dataset}.{load_config.table_name}',
+                    job_config=load_job_config,
+                )
+                job.result()
+
+
+def process_file_catching(filepath, context: LoadDagContext, **kwargs):
+    def push(value: dict):
+        ti = kwargs["ti"]
+        ti.xcom_push(key='process_result', value=value)
+
+    bq_client = build_bq_client()
+    result = None
+    try:
+        process_file(filepath, bq_client, context)
+        result = {"status": "SUCCESS", "message": ""}
+    except ProcessException as ex:
+        traceback.print_tb(ex.__traceback__)
+        result = {"status": "ERROR", "message": f"{ex.description}"}
+    except Exception as ex:
+        traceback.print_tb(ex.__traceback__)
+        logger.error("Process error: %s", ex)
+        result = {"status": "ERROR", "message": "An unexpected error occured. Please, contact the developer"}
+
+    push(result)
+
+    files_log = FilesLog(
+        file_name=filepath.split("/")[-1],
+        date_time=datetime.today().strftime("%d/%m/%Y %H:%M:%S"),
+        status=result["status"],
+        error_message=None if result["status"] == "SUCCESS" else result["message"]
+    )
+    load_job_config = bigquery.LoadJobConfig(
+        schema=FilesLogDWHTable.schema,
+        write_disposition='WRITE_APPEND',
+    )
+    job = bq_client.load_table_from_dataframe(
+        dataframe=files_log.as_dataframe(),
+        destination=f'{FilesLogDWHTable.dataset}.{FilesLogDWHTable.table_name}',
+        job_config=load_job_config,
+    )
+    job.result()
+
+
+def notify_status(filename, **kwargs):
+    ti = kwargs["ti"]
+    result = ti.xcom_pull(key='process_result')
+    if result["status"] == "SUCCESS":
+        StatusInformer().done(file_name=filename, env=environment)
+    elif result["status"] == "ERROR":
+        StatusInformer().error(file_name=filename, message=result["message"], env=environment)
+    else:
+        raise Exception("Unexpected status")
+
+
+def construct_filename(dt, **kwargs):
+    ti = kwargs["ti"]
+    filename = ti.xcom_pull(key="return_value")[0].split('/')[-1]
+    result = ti.xcom_pull(key='process_result')
+
+    new_filename = filename.replace('.xlsm', f"_{result['status']}_{dt}.xlsm")
+    ti.xcom_push(key="new_filename", value=new_filename)
+
+
+def create_load_dag(context: LoadDagContext):
+    dag = DAG(
+        dag_id=f"load_{context.name}",
+        start_date=datetime(2024, 1, 15),
+        catchup=False,
+        max_active_runs=1,
+        default_args={
+            "owner": "rubbles",
+            "do_xcom_push": False,
+            "retries": 0,
+            "retry_delay": timedelta(minutes=1),
+        },
+        schedule="0 * * * *",
+        render_template_as_native_obj=True
+    )
+    with dag:
+        BUCKET = "pc-pac-bucket"
+        DATA_DIRECTORY = "/home/airflow/gcs/data"
+        UPLOADS_DIRECTORY = "uploads"
+        ARCHIVE_DIRECTORY = "archive"
+
+        is_file_exists = CustomGCSObjectExistenceSensor(
+            task_id="is_file_exists",
+            bucket=BUCKET,
+            prefix=f"{UPLOADS_DIRECTORY}/",
+            match_pattern=context.file_pattern,
+            mode="reschedule",
+            poke_interval=60,
+            soft_fail=True,
+            timeout=24 * 60 * 60,
+        )
+
+        delete_data_files = PythonOperator(task_id="delete_data_files",
+                                           python_callable=clean_folder,
+                                           op_kwargs={
+                                               "path": f"{DATA_DIRECTORY}/{context.name}"
+                                           }
+                                           )
+
+        get_file_names = CustomGCSListObjectsOperator(
+            task_id="get_file_names",
+            bucket=BUCKET,
+            prefix=f"{UPLOADS_DIRECTORY}/",
+            match_pattern=context.file_pattern,
+            do_xcom_push=True
+        )  # push to xcom with key "return_value"
+
+        filename = "{{ task_instance.xcom_pull(key='return_value')[0].split('/')[-1] }}"
+
+        download_file = GCSToLocalFilesystemOperator(
+            task_id="download_file",
+            object_name=f"{UPLOADS_DIRECTORY}/{filename}",
+            bucket=BUCKET,
+            filename=f"{DATA_DIRECTORY}/{context.name}/{filename}",
+        )
+
+        get_file_owner = EmptyOperator(task_id="get_file_owner")  # todo
+
+        # get_file_owner = GCSGetFileOwnerOperator(
+        #     task_id="get_file_owner",
+        #     bucket=BUCKET,
+        #     filepath=f"{UPLOADS_DIRECTORY}/{filename}",
+        #     xcom_key="file_owner"
+        # )
+
+        process = PythonOperator(task_id="process",
+                                 python_callable=process_file_catching,
+                                 op_kwargs={
+                                     "context": context,
+                                     "filepath": f"{DATA_DIRECTORY}/{context.name}/{filename}",
+                                 }
+                                 )
+
+        notification = PythonOperator(task_id="notification",
+                                      python_callable=notify_status,
+                                      op_kwargs={
+                                          "filename": filename
+                                      }
+                                      )
+
+        construct_new_filename = PythonOperator(task_id="construct_new_filename",
+                                                python_callable=construct_filename,
+                                                op_kwargs={"dt": "{{dag_run.logical_date}}"}
+                                                )
+
+        new_filename = "{{ task_instance.xcom_pull(key='new_filename') }}"
+        move_to_archive = GCSToGCSOperator(
+            task_id="move_to_archive",
+            source_bucket=BUCKET,
+            source_object=f"{UPLOADS_DIRECTORY}/{filename}",
+            destination_object=f"{ARCHIVE_DIRECTORY}/{new_filename}",
+            move_object=True,
+            exact_match=True,
+        )
+
+        # Чтение SQL из файла
+        with open('/sql/dm_summary.sql', 'r') as f:
+            sql_query = f.read()
+
+        update_dm = BigQueryInsertJobOperator(
+            task_id="update_dm_summary",
+            configuration={
+                "query": {
+                    "query": sql_query,
+                    "useLegacySql": False,
+                }
+            },
+            gcp_conn_id=GCP_CONN_ID,
+            execution_timeout=timedelta(minutes=5),
+        )
+
+        done = EmptyOperator(task_id="done")
+
+        trigger_next = TriggerDagRunOperator(task_id='trigger_next', trigger_dag_id=dag.dag_id)
+
+        is_file_exists >> get_file_names >> download_file >> get_file_owner >> process >> notification >> delete_data_files >> construct_new_filename >> move_to_archive >> update_dm >> done >> trigger_next
+
+    return dag
+
+
+contexts = [marketing_plans.context, price_plans.context, volume_plans.context, focus_group.context]
+
+for context in contexts:
+    dag = create_load_dag(context)
+    globals()[dag.dag_id] = dag
